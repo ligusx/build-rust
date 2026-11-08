@@ -38,4 +38,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ws-auto-proxy-linux-x86_64
-          path: target/release/ws-auto-proxy
+          path: target/release/webhook-to-ws
