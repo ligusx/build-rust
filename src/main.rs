@@ -1,142 +1,76 @@
-use futures_util::{SinkExt, StreamExt};
-use std::env;
-use std::io::BufReader;
-use std::sync::Arc;
-use tokio::io::AsyncReadExt;
-use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio_rustls::rustls::ServerConfig;
-use tokio_rustls::TlsAcceptor;
-use tokio_tungstenite::tungstenite::Message;
+use axum::{
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
+    response::IntoResponse,
+    routing::{get, post},
+    Router,
+};
+use futures_util::SinkExt;
+use std::{net::SocketAddr, sync::Arc};
+use tokio::sync::broadcast;
 
-fn load_tls_acceptor(cert_path: &str, key_path: &str) -> TlsAcceptor {
-    let cert_file = std::fs::File::open(cert_path).expect("open cert failed");
-    let certs: Vec<CertificateDer> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
-        .collect::<Result<_, _>>()
-        .expect("parse certs failed");
-
-    let key_file = std::fs::File::open(key_path).expect("open key failed");
-    let key: PrivateKeyDer = rustls_pemfile::private_key(&mut BufReader::new(key_file))
-        .expect("parse key failed")
-        .expect("no private key found");
-
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .expect("build tls config failed");
-
-    TlsAcceptor::from(Arc::new(config))
-}
-
-async fn handle_ws_bridge<S>(stream: S, target_url: String)
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let client_ws = match tokio_tungstenite::accept_async(stream).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            eprintln!("ws accept failed: {e}");
-            return;
-        }
-    };
-
-    let backend_ws = match tokio_tungstenite::connect_async(&target_url).await {
-        Ok((ws, _)) => ws,
-        Err(e) => {
-            eprintln!("connect target {target_url} failed: {e}");
-            return;
-        }
-    };
-
-    println!("bridged to {target_url}");
-
-    let (mut client_tx, mut client_rx) = client_ws.split();
-    let (mut backend_tx, mut backend_rx) = backend_ws.split();
-
-    let c2b = async {
-        while let Some(item) = client_rx.next().await {
-            match item {
-                Ok(msg) => {
-                    if backend_tx.send(msg).await.is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("client recv error: {e}");
-                    break;
-                }
-            }
-        }
-        let _ = backend_tx.send(Message::Close(None)).await;
-    };
-
-    let b2c = async {
-        while let Some(item) = backend_rx.next().await {
-            match item {
-                Ok(msg) => {
-                    if client_tx.send(msg).await.is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("backend recv error: {e}");
-                    break;
-                }
-            }
-        }
-        let _ = client_tx.send(Message::Close(None)).await;
-    };
-
-    tokio::select! {
-        _ = c2b => {},
-        _ = b2c => {},
-    }
-
-    println!("bridge closed");
-}
-
-async fn handle_connection(mut stream: TcpStream, target_url: String, tls_acceptor: TlsAcceptor) {
-    let mut first_byte = [0u8; 1];
-    if stream.peek(&mut first_byte).await.is_err() {
-        return;
-    }
-
-    if first_byte[0] == 0x16 {
-        // TLS 握手，之后走 wss 路径
-        match tls_acceptor.accept(stream).await {
-            Ok(tls_stream) => handle_ws_bridge(tls_stream, target_url).await,
-            Err(e) => eprintln!("tls accept failed: {e}"),
-        }
-    } else {
-        // 明文，走 ws 路径
-        handle_ws_bridge(stream, target_url).await;
-    }
-}
+// 定义一个广播通道，用于将 HTTP 收到的消息分发给所有的 WebSocket 客户端
+type Tx = broadcast::Sender<String>;
 
 #[tokio::main]
 async fn main() {
-    let listen_addr = env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:9000".into());
-    let target_url = env::var("TARGET_URL")
-        .unwrap_or_else(|_| "ws://127.0.0.1:8080/notify".into());
-    let cert_path = env::var("TLS_CERT").unwrap_or_else(|_| "cert.pem".into());
-    let key_path = env::var("TLS_KEY").unwrap_or_else(|_| "key.pem".into());
+    // 创建广播通道，容量设为 100
+    let (tx, _rx) = broadcast::channel::<String>(100);
+    let app_state = Arc::new(tx);
 
-    let tls_acceptor = load_tls_acceptor(&cert_path, &key_path);
-    let listener = TcpListener::bind(&listen_addr).await.expect("bind failed");
+    // 路由配置
+    let app = Router::new()
+        // 手机 App 连接的 WebSocket 接口
+        .route("/ws", get(ws_handler))
+        // 闲鱼系统填写的 Webhook 接口
+        .route("/webhook", post(webhook_handler))
+        .with_state(app_state);
 
-    println!("listening {listen_addr}, ws/wss auto, target {target_url}");
+    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+    println!("服务器启动，监听: {}", addr);
+    println!("Webhook 地址: http://<你的服务器IP>:3000/webhook");
+    println!("WebSocket 地址: ws://<你的服务器IP>:3000/ws");
 
-    loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                let target = target_url.clone();
-                let acceptor = tls_acceptor.clone();
-                tokio::spawn(async move {
-                    handle_connection(stream, target, acceptor).await;
-                    let _ = addr;
-                });
-            }
-            Err(e) => eprintln!("accept error: {e}"),
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+// 处理手机的 WebSocket 连接
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(tx): State<Arc<Tx>>,
+) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_socket(socket, tx))
+}
+
+async fn handle_socket(mut socket: WebSocket, tx: Arc<Tx>) {
+    // 订阅消息
+    let mut rx = tx.subscribe();
+
+    println!("新的手机客户端已连接");
+
+    // 循环等待接收广播消息，并发送给手机
+    while let Ok(msg) = rx.recv().await {
+        if socket.send(Message::Text(msg)).await.is_err() {
+            // 发送失败说明手机断开了
+            break;
         }
     }
+    println!("手机客户端已断开");
+}
+
+// 处理来自闲鱼系统的 HTTP POST 请求
+async fn webhook_handler(
+    State(tx): State<Arc<Tx>>,
+    body: String, // 直接接收原始 body 字符串
+) -> &'static str {
+    println!("收到 Webhook 数据: {}", body);
+
+    // 将收到的内容通过广播通道发送给所有连接的手机
+    // 如果你需要解析 JSON，可以在这里用 serde_json 处理
+    let _ = tx.send(body);
+
+    "OK"
 }
