@@ -1,0 +1,22 @@
+name: Release Linux CLI
+on:
+  workflow_dispatch:  # 改为手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+
+      - name: Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ github.run_number }}  # 自动生成版本号
+          files: target/release/ws
+          generate_release_notes: true
